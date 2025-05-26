@@ -99,15 +99,24 @@ def get_optimizer(
         optimizer = Automagic(params, lr=float(learning_rate), **optimizer_params)
     elif lower_type == 'agd':
         from toolkit.optimizers.agdesc import AGD
-        if 'net' not in optimizer_params:
-            raise ValueError("AGD optimizer requires 'net' (the model) to be passed in optimizer_params")
-        net = optimizer_params.pop('net')
-        # Use learning_rate as gain, or allow gain in optimizer_params to override, default gain is 1.0
-        gain = optimizer_params.pop('gain', learning_rate if learning_rate is not None else 1.0)
-        # AGD does not use 'eps' or 'lr', so remove them if they were passed in optimizer_params from a general config
-        optimizer_params.pop('eps', None)
-        optimizer_params.pop('lr', None)
-        optimizer = AGD(net, gain=gain, **optimizer_params)
+        # Work with a copy of optimizer_params to avoid modifying the original dict if passed from outside
+        # and to allow modifications specific to the chosen optimizer path.
+        active_optimizer_params = optimizer_params.copy() if optimizer_params is not None else {}
+
+        # 'net' is no longer required for AGD optimizer instantiation itself.
+        # User is responsible for calling initialize_model_for_agd(model) separately.
+        # We pop 'net' here from active_optimizer_params if it was provided, as AGD constructor doesn't use it.
+        active_optimizer_params.pop('net', None)
+        
+        # Pop 'gain' to pass it explicitly, using learning_rate as a fallback if 'gain' not in optimizer_params.
+        gain = active_optimizer_params.pop('gain', learning_rate if learning_rate is not None else 1.0)
+        
+        # AGD constructor doesn't use 'eps' or 'lr'; pop them to avoid passing as unexpected kwargs.
+        active_optimizer_params.pop('eps', None)
+        active_optimizer_params.pop('lr', None)
+        
+        # The refactored AGD takes params, gain, and **kwargs (which might be empty now)
+        optimizer = AGD(params, gain=gain, **active_optimizer_params)
     else:
         raise ValueError(f'Unknown optimizer type {optimizer_type}')
     return optimizer

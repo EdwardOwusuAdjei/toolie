@@ -1,5 +1,6 @@
 import math
 import torch
+from torch.optim import Optimizer # Import Optimizer
 from torch.nn.init import orthogonal_
 import warnings # Added for issuing warnings
 
@@ -35,104 +36,154 @@ def singular_value(p):
             return 0.0
     return sv
 
-class AGD:
-    @torch.no_grad()
-    def __init__(self, net, gain=1.0):
-        self.net = net
-        self.depth = 0
-        if hasattr(net, 'parameters'):
-            params = list(net.parameters())
-            self.depth = len(params)
+@torch.no_grad()
+def initialize_model_for_agd(net):
+    """
+    Performs AGD-specific weight initialization on the given network.
+    This includes orthogonal initialization and singular value scaling.
+    This function should be called BEFORE creating the AGD optimizer
+    if the full AGD behavior (including its prescribed initialization) is desired.
+
+    Args:
+        net (torch.nn.Module): The network whose parameters will be initialized.
+    """
+    if not hasattr(net, 'parameters'):
+        warnings.warn("initialize_model_for_agd: Network has no 'parameters' attribute. Skipping initialization.", UserWarning)
+        return
+
+    for p in net.parameters():
+        if p.numel() == 0:
+            warnings.warn(f"initialize_model_for_agd: Skipping parameter with shape {p.shape} because it's empty.", UserWarning)
+            continue
+
+        if p.dim() == 1:
+            # The paper explicitly states biases are not supported.
+            # Depending on strictness, this could be a warning or an error.
+            # For now, we'll issue a warning and skip AGD init for it.
+            warnings.warn(f"initialize_model_for_agd: Biases or 1D parameters (shape: {p.shape}) are not initialized by AGD's scheme. Skipping.", UserWarning)
+            continue
+        
+        sv_p = singular_value(p)
+        if sv_p == 0.0 and p.numel() > 0:
+            warnings.warn(f"initialize_model_for_agd: Skipping AGD initialization for parameter shape {p.shape} due to ill-defined singular value.", UserWarning)
+            continue
+
+        if p.dim() == 2:
+            orthogonal_(p)
+            p.mul_(sv_p)
+        elif p.dim() == 4:
+            for kx in range(p.shape[2]):
+                for ky in range(p.shape[3]):
+                    if p.shape[0] > 0 and p.shape[1] > 0:
+                         orthogonal_(p[:,:,kx,ky])
+            p.mul_(sv_p)
         else:
-            warnings.warn("AGD.__init__: Network has no 'parameters' attribute. Depth set to 0.", UserWarning)
-            params = []
+            warnings.warn(f"initialize_model_for_agd: Skipping AGD-specific initialization for parameter with unsupported dimension {p.dim()} (shape: {p.shape}).", UserWarning)
+
+class AGD(Optimizer): # Inherit from torch.optim.Optimizer
+    """
+    Automatic Gradient Descent (AGD) optimizer.
+    Inherits from torch.optim.Optimizer for compatibility with PyTorch LR Schedulers.
+
+    IMPORTANT: This optimizer applies the AGD update rule. For the full AGD
+    method as described in the paper "Automatic Gradient Descent: Deep Learning 
+    without Hyperparameters", the model's weights should be initialized using
+    the `initialize_model_for_agd(model)` function from this module BEFORE
+    this optimizer is created.
+    """
+    def __init__(self, params, gain=1.0, **kwargs):
+        if kwargs:
+            # Filter out 'lr' if it was passed, as AGD uses 'gain' and super() doesn't expect it if not in defaults
+            # However, generally, an optimizer constructor shouldn't silently ignore standard optimizer params like 'lr'.
+            # For AGD, 'gain' is the primary control. We could warn if 'lr' is in kwargs and != default for gain.
+            filtered_kwargs = {k: v for k, v in kwargs.items() if k not in ['lr', 'eps']}
+            if filtered_kwargs:
+                 warnings.warn(f"AGD.__init__: Received unexpected keyword arguments: {filtered_kwargs.keys()}. These will be ignored by AGD specific logic.", UserWarning)
+        
+        # Defaults for the optimizer (can be empty if AGD doesn't use them for param_groups)
+        defaults = dict()
+        super().__init__(params, defaults) # Call superclass constructor
+
+        # self.params is not strictly needed anymore if we iterate param_groups, but depth calculation uses it.
+        # self.param_groups is now the source of truth for parameters.
+        
+        # Calculate depth based on the number of parameter groups, 
+        # or sum of parameters in all groups. The paper implies L is count of parameter tensors.
+        # Let's count unique parameter tensors across all groups, which is robust.
+        all_params_in_groups = set()
+        for group in self.param_groups:
+            for p in group['params']:
+                all_params_in_groups.add(p)
+        self.depth = len(all_params_in_groups)
+
+        if self.depth == 0:
+            warnings.warn("AGD.__init__: Optimizer initialized with no parameters.", UserWarning)
             
         self.gain = gain
 
-        if self.depth == 0:
-            warnings.warn("AGD.__init__: No parameters found in the network. Skipping AGD initialization.", UserWarning)
-            return
-
-        for p in params:
-            if p.numel() == 0:
-                warnings.warn(f"AGD.__init__: Skipping parameter with shape {p.shape} because it's empty.", UserWarning)
-                continue
-
-            if p.dim() == 1:
-                raise Exception(f"AGD.__init__: Biases or 1D parameters (shape: {p.shape}) are not supported by AGD.")
-            
-            sv_p = singular_value(p) # Check for ill-defined scaling early
-            if sv_p == 0.0 and p.numel() > 0: # If singular_value returned 0 due to bad dims for a non-empty tensor
-                warnings.warn(f"AGD.__init__: Skipping AGD initialization for parameter shape {p.shape} due to ill-defined singular value.", UserWarning)
-                continue
-
-            if p.dim() == 2:
-                orthogonal_(p) # Modifies p in-place
-                p.mul_(sv_p)   # Modifies p in-place
-            elif p.dim() == 4:
-                # Orthogonalize each (cin, cout) sub-matrix for each (kx, ky)
-                # This was already in the loop, singular_value checks dimensions
-                for kx in range(p.shape[2]):
-                    for ky in range(p.shape[3]):
-                        if p.shape[0] > 0 and p.shape[1] > 0: # Ensure submatrix is not empty
-                             orthogonal_(p[:,:,kx,ky])
-                p.mul_(sv_p) # Modifies p in-place
-            else:
-                warnings.warn(f"AGD.__init__: Skipping AGD-specific initialization for parameter with unsupported dimension {p.dim()} (shape: {p.shape}).", UserWarning)
-
     @torch.no_grad()
-    def step(self):
+    def step(self, closure=None): # Add closure=None for Optimizer compatibility
+        """Performs a single optimization step."""
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
         if self.depth == 0:
-            # This warning is now in __init__ if depth is 0 at construction.
-            # If parameters were removed after init, this is a safeguard.
-            warnings.warn("AGD.step: No parameters in the model (depth=0), skipping step.", UserWarning)
-            return
+            # warnings.warn("AGD.step: No parameters in the optimizer, skipping step.", UserWarning) # Already warned in init
+            return loss if closure is not None else None
 
         G = 0.0
-        params_for_step = [param for param in self.net.parameters() if param.grad is not None and param.numel() > 0]
-
-        if not params_for_step:
-            warnings.warn("AGD.step: No parameters with gradients or non-empty parameters found. Skipping G calculation and updates.", UserWarning)
-            # eta will be based on G=0.0, no updates will occur if loop is empty
-        
-        for p in params_for_step:
-            if p.dim() not in [2, 4]:
-                # warnings.warn(f"AGD.step: Skipping parameter with unsupported dimension {p.dim()} (shape: {p.shape}) for G calculation.", UserWarning)
-                continue # Will not contribute to G and not be updated
-
-            sv_p = singular_value(p)
-            if sv_p == 0.0: # Ill-defined scaling for this parameter
-                # warnings.warn(f"AGD.step: Singular value is 0 for parameter shape {p.shape}. Skipping its contribution to G.", UserWarning)
-                continue
+        params_for_G_calc = []
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is not None and p.numel() > 0:
+                    if p.dim() in [2, 4]:
+                        params_for_G_calc.append(p)
             
-            # grad.norm(dim=(0,1)) is Frobenius for 2D, or (H,W) tensor of norms for 4D
-            grad_norm_sum = p.grad.norm(dim=(0,1)).sum()
-            G += sv_p * grad_norm_sum
+        if not params_for_G_calc:
+            # warnings.warn("AGD.step: No suitable parameters found for G calculation. G will be 0.", UserWarning)
+            pass # G remains 0.0
+        else:
+            for p in params_for_G_calc:
+                sv_p = singular_value(p)
+                if sv_p == 0.0:
+                    continue
+                grad_norm_sum = p.grad.norm(dim=(0,1)).sum()
+                G += sv_p * grad_norm_sum
         
-        G /= self.depth # Normalize by the total number of parameters, as per paper
+        # Normalize G by self.depth
+        # Ensure self.depth is not zero to prevent division by zero if init somehow resulted in depth=0 but step is called.
+        if self.depth > 0:
+            G /= self.depth
+        else: # Should not happen if init warned and step returned early for depth 0
+            G = 0.0 
         
-        if G < 0.0: G = 0.0 # Guard against tiny negative G due to float precision
+        if G < 0.0: G = 0.0
         try:
             eta = math.log(0.5 * (1 + math.sqrt(1 + 4 * G)))
-        except ValueError: # Should G be extremely negative for some reason
+        except ValueError:
             eta = 0.0
-            warnings.warn(f"AGD.step: ValueError calculating eta with G={G}. Setting eta to 0.", UserWarning)
+            # warnings.warn(f"AGD.step: ValueError calculating eta with G={G}. Setting eta to 0.", UserWarning)
 
-        for p in params_for_step:
-            if p.dim() not in [2, 4]:
-                warnings.warn(f"AGD.step: Skipping update for parameter with unsupported dimension {p.dim()} (shape: {p.shape}).", UserWarning)
-                continue
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None or p.numel() == 0:
+                    continue
 
-            grad = p.grad
-            sv_p = singular_value(p)
+                if p.dim() not in [2, 4]:
+                    # warnings.warn(f"AGD.step: Skipping update for parameter with unsupported dimension {p.dim()} (shape: {p.shape}).", UserWarning)
+                    continue
 
-            if sv_p == 0.0: # Parameter had ill-defined scaling
-                warnings.warn(f"AGD.step: Singular value is 0 for parameter shape {p.shape}. Skipping update.", UserWarning)
-                continue
-            
-            grad_norm_slice = p.grad.norm(dim=(0,1), keepdim=True)
-            
-            # Add EPSILON to prevent division by zero
-            factor = sv_p / (grad_norm_slice + _EPSILON)
-            
-            p.add_(-self.gain * eta / self.depth * factor * grad)
+                grad = p.grad
+                sv_p = singular_value(p)
+
+                if sv_p == 0.0:
+                    # warnings.warn(f"AGD.step: Singular value is 0 for parameter shape {p.shape}. Skipping update.", UserWarning)
+                    continue
+                
+                grad_norm_slice = p.grad.norm(dim=(0,1), keepdim=True)
+                factor = sv_p / (grad_norm_slice + _EPSILON)
+                
+                p.add_(-self.gain * eta / self.depth * factor * grad if self.depth > 0 else 0.0)
+        
+        return loss if closure is not None else None
